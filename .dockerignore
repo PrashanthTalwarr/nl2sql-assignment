@@ -1,0 +1,12 @@
+.venv/
+.env
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+schema/generated/
+scripts/
+evals/
+*.md
+!docs/*.md
+requirements-dev.txt
