@@ -1,0 +1,15 @@
+﻿[PASS] Health endpoint  
+[PASS] 3 mock logins offered  
+[PASS] Unknown user cannot log in  
+[PASS] Non-mock user cannot log in  
+[PASS] RAM login returns token  New York Metro territory ╖ no pricing
+[PASS] Chat without token rejected  
+[PASS] Tampered token rejected  
+[PASS] Forged Exec token (wrong secret) rejected  
+[PASS] Empty message rejected  
+[PASS] Injected 'system' role rejected  
+[PASS] Rate limit triggers after 20/min  
+[PASS] Real chat as RAM works  rows=3 verified=True
+   ANSWER: Your top 3 accounts by pack units in the New York Metro territory are Jubilee Clinical Network with 23,014 units, Maple Health Alliance with 17,751 units, and Prairie Clinical Network with 17,626 units. This ranking covers all available data through September 19, 2026.
+
+12/12 checks passed

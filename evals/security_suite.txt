@@ -1,0 +1,21 @@
+﻿  Exec sees 15 territories (0.05s)
+  Director sees 2 territories (0.01s)
+  RAM sees 1 territories (0.01s)
+[PASS] RAM sees only New York Metro  ['New York Metro']
+[PASS] Director sees only Northeast territories  ['New England', 'New York Metro']
+  Exec sales rows: 2,000,000 (0.05s)
+  Director sales rows: 268,912 (0.43s)
+  RAM sales rows: 136,921 (0.04s)
+[PASS] Sales scoping Exec > Director > RAM > 0  
+[PASS] RAM asking for Texas gets nothing  rows=0
+[PASS] Exec view includes wac  
+[PASS] RAM view has NO wac column  
+[PASS] Guard blocks SUM(wac) for RAM  
+[PASS] Guard blocks SUM(wac) for Director  
+[PASS] Exec can SUM(wac)  
+[PASS] Blocks main.sales bypass  
+[PASS] Blocks DROP TABLE  
+[PASS] Blocks multi-statement  
+[PASS] Blocks reading users table  
+
+13/13 checks passed

@@ -1,0 +1,19 @@
+﻿[PASS] Detects guessed health-system name  
+[PASS] Detects two guessed names  
+[PASS] Detects escaped quote in name  
+[PASS] Ignores LIKE filters  
+[PASS] Distinctive word skips generic words  
+[PASS] Accepts old single 'term' format  
+[PASS] De-duplicates and caps at 3  
+[PASS] Drops empty / 1-char terms  
+[PASS] Wrong name triggers the backstop  terms=['Memorial'] matches={'Memorial': 10}
+[PASS] Backstop gives a useful result  kind=clarify options=['How is Memorial Medical Alliance doing?', 'How is Memorial Healthcare doing?', 'How is Memorial Health Network doing?', 'How is Memorial Clinical Network doing?']
+[PASS] Backstop used exactly one hop  
+   ANSWER: There are several 'Memorial' organizations in the data. Which one did you mean?
+[PASS] Real name with no data is left alone  name=Alliance Care Network kind=query
+[PASS] Two terms searched in one lookup  matches={'Memorial': 10, 'Lakeshore': 10}
+[PASS] Two-name lookup used exactly one hop  
+[PASS] Two-name lookup gives a useful result  kind=clarify options=['Compare Memorial Health Network vs Lakeshore Health Partners', 'Compare Memorial Medical Alliance vs Lakeshore Medical Center', 'Compare Memorial Healthcare vs Lakeshore Clinical Network', 'Compare Memorial Clinical Network vs Lakeshore Care Network']
+   ANSWER: Both 'Memorial' and 'Lakeshore' match multiple organizations. Please pick one from each side so I can run the comparison:
+
+15/15 checks passed
