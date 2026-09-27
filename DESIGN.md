@@ -7,8 +7,8 @@ against the query result in code** before it is shown.
 
 | | |
 |---|---|
-| **Live URL** | `<APP RUNNER URL>` |
-| **Stack** | FastAPI · SQLite (read-only, in the image) · Claude Sonnet (planner) + Claude Haiku (answers) · AWS App Runner + ECR + CloudWatch |
+| **Live URL** | http://35.90.30.116|
+| **Stack** | FastAPI · SQLite (read-only, in the image) · Claude Sonnet (planner) + Claude Haiku (answers) · AWS EC2 (Docker) + ECR + CloudWatch |
 | **Agent design** | Bounded workflow agent: the LLM makes the judgment calls (plan, look up, clarify, refuse); code enforces every limit (security, hop and retry budgets, number verification) |
 | **Priorities** | **Accuracy > latency > cost**, and security never depends on the LLM |
 | **Evaluation** | **36/36** cases pass across 6 categories and 5 rubric dimensions. The first run scored 30/36 and found real defects, which were fixed. See [`evals/results_final.md`](evals/results_final.md) and [`TEST_RESULTS.md`](TEST_RESULTS.md) |
@@ -68,7 +68,7 @@ principle higher in this list won.
 | Domain knowledge (market share formula, "sales" = paid demand) | Full docs in the prompt + distilled rules + runtime facts | [6](#6-how-domain-knowledge-is-integrated) |
 | RBAC: RAM → territory, Director → region, Exec → all; WAC hidden from non-Execs | Per-request scoped TEMP views, WAC column removed, SQL guard | [8](#8-security-implementation) |
 | Works on the full dataset (40K orgs, 2M rows) | Indexed, read-only SQLite; aggregations in 0.1–2.2s | [5](#5-database-choice-and-rationale) |
-| Cloud deployment + IaC or setup instructions | App Runner + ECR + CloudWatch; step-by-step commands in `DEPLOY.md` | [10](#10-cloud-services-and-deployment) |
+| Cloud deployment + IaC or setup instructions | EC2 (Docker) + ECR + IAM role + CloudWatch; step-by-step commands in `DEPLOY.md` | [10](#10-cloud-services-and-deployment) |
 | Test cases and results | DeepEval-based suite (36 cases) + deterministic suites | [12](#12-evaluation-and-testing) |
 | Document assumptions | Design and data assumptions with evidence | [15](#15-assumptions) |
 
@@ -78,7 +78,7 @@ principle higher in this list won.
 
 ```mermaid
 flowchart LR
-    U["Browser chat UI"] -->|"signed session token"| API["FastAPI app on AWS App Runner"]
+    U["Browser chat UI"] -->|"signed session token"| API["FastAPI container on AWS EC2"]
     API --> A["Agent: one chat turn"]
     A -->|"plan / resolve / repair"| L1["Claude Sonnet"]
     A -->|"answer / correct / explain"| L2["Claude Haiku"]
@@ -427,19 +427,22 @@ A single `SELECT`/`WITH` statement; no write or DDL keywords (`INSERT/UPDATE/DEL
 
 | Service | Role | Why |
 |---|---|---|
-| **Amazon ECR** | Stores the container image (app + read-only database) | Private, versioned images that App Runner pulls directly |
-| **AWS App Runner** | Runs the container behind a public HTTPS URL; health checks on `/api/health` | The simplest managed option for one web container: no VPC, load balancer, or cluster; HTTPS and scaling built in; supports streamed responses |
-| **Amazon CloudWatch Logs** | Receives the app's JSON logs from stdout | Queryable with Logs Insights (section 11) |
+| **Amazon ECR** | Stores the container image (app + read-only database) | Private, versioned images; the EC2 instance pulls them with its IAM role |
+| **Amazon EC2** (t3.small, Amazon Linux 2023) | Runs the Docker container on port 80, with `--restart unless-stopped` and a container health check | The same image that was tested locally runs unchanged; fewest moving parts for a single container |
+| **IAM instance role** | Grants the instance ECR pull and CloudWatch write access | **No AWS keys stored on the server** |
+| **Amazon CloudWatch Logs** | Receives the app's JSON logs through Docker's `awslogs` driver (log group `/nl2sql-pharma`) | Queryable with Logs Insights (section 11) |
+
+**Why EC2 and not App Runner:** App Runner, the original choice (managed HTTPS and scaling for one container), **stopped accepting new customers on April 30, 2026**. The container was designed to be platform-neutral, so it moved to EC2 without code changes; it would also run unchanged on ECS Fargate or ECS Express Mode.
 
 **Container:** `python:3.12-slim`, pinned runtime dependencies, non-root user, health check, `uvicorn` on port 8080. `.dockerignore` keeps `.env`, the virtual environment, raw CSVs, scripts, and eval files out of the image.
 
-**Secrets:** API keys and the session secret are App Runner environment variables, never in the image or repository. In production: AWS Secrets Manager.
+**Secrets:** API keys and the session secret live in an owner-only file on the instance (`chmod 600`), passed to the container as environment variables; never in the image or repository. In production: AWS Secrets Manager.
 
 | Alternative | Why not chosen |
 |---|---|
-| ECS Fargate | Needs an ALB, VPC, task definitions: more setup than one container needs |
+| App Runner | Closed to new customers (April 30, 2026) |
+| ECS Fargate / ECS Express Mode | The right next step for rolling deploys and multiple instances; needs an ALB, task definitions, and more setup than the deadline allowed |
 | Lambda | A 300MB SQLite file plus streamed responses fit poorly with packaging and cold starts |
-| EC2 | Kept as the fallback path; manual patching and HTTPS setup |
 | RDS / Aurora | Unnecessary for a read-only 300MB dataset |
 | Bedrock | A reasonable in-AWS LLM option; the provider layer is pluggable, and Anthropic's API was used directly for faster iteration |
 
@@ -544,7 +547,7 @@ LLM generation accounts for 80–90% of latency.
 | Failures | Explain + suggest; classified errors | Generic errors | No dead ends; no internals leaked |
 | Auth | Mock login + signed tokens | Real identity provider | In scope; identity still can't be forged |
 | Evaluation | Execution accuracy + cross-family judge + deterministic caps | Judge-only | Code checks what code can check |
-| Deployment | App Runner | ECS / EKS / Lambda | Managed HTTPS and scaling for one container |
+| Deployment | EC2 + Docker (same image as local) | ECS / EKS / Lambda | App Runner closed to new customers; EC2 is the fewest moving parts for one container, and the image runs unchanged on ECS |
 
 **Considered and deliberately not built:** a keyword pre-check that refuses pricing questions before any LLM call (a cost optimization only; security doesn't depend on it); a semantic catalog in code (maintainability, with no accuracy gain); long-term memory; OpenTelemetry tracing (single service); in-app live evaluations (anyone with the URL could spend API credits, and it needs background-job infrastructure).
 
@@ -592,6 +595,8 @@ LLM generation accounts for 80–90% of latency.
 - **Mock authentication:** not production-grade; sessions are stateless and can't be revoked before expiry.
 - **Cold start:** the first question after a deploy or idle period takes ~17s until the prompt cache warms.
 - **Judge validation:** the judge prompt was refined between runs (each change backed by deterministic evidence); judged scores should still be spot-checked by a human.
+- **HTTP only:** the demo serves plain HTTP on the instance's public IP. Production would add an Application Load Balancer with an ACM certificate (HTTPS) and a domain name.
+- **Single instance, dynamic IP:** stopping the instance changes the public IP; production would use an Elastic IP or a load balancer, plus ECS for multiple instances.
 
 ---
 
