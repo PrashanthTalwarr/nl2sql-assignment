@@ -40,7 +40,7 @@ logging.getLogger("nl2sql").setLevel(logging.INFO)
 
 
 def fake_plan(result):
-    return lambda user, messages, periods: result
+    return lambda user, messages, periods, **kw: result
 
 
 def query_plan(sql):

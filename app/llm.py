@@ -9,6 +9,10 @@ LLM layer.
   answer_stream()   : same, streamed token by token
   explain_sql()     : plain-English, step-by-step explanation of a query the user explicitly asked to see
 
+Every public function accepts an optional `trace` (app/trace.py). Each LLM call is then recorded
+as a step with provider, model, token usage (input / output / cache read / cache write),
+estimated cost, latency, and any error.
+
 Reliability:
   - Every JSON call gets ONE automatic retry if the model returns malformed JSON.
   - LLMUnavailable is raised when every configured provider fails (outage / auth / rate
@@ -29,6 +33,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 
@@ -49,6 +54,14 @@ ANSWER_MODELS = {
     "anthropic": os.getenv("ANSWER_ANTHROPIC_MODEL") or MODELS["anthropic"],
 }
 KEY_VARS = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+
+# Estimated list prices, USD per million tokens: (input, output, cache read, cache write).
+# Used only for the cost estimate in the trace; update if pricing changes.
+PRICES = {
+    "claude-sonnet-4-6": (3.00, 15.00, 0.30, 3.75),
+    "claude-haiku-4-5-20251001": (1.00, 5.00, 0.10, 1.25),
+    "gpt-4o": (2.50, 10.00, 1.25, 0.00),
+}
 
 log = logging.getLogger("nl2sql.llm")
 _clients = {}
@@ -73,6 +86,46 @@ def _client(provider):
     return _clients[provider]
 
 
+# ---------------------------------------------------------------------------
+# Token usage and cost (for the trace)
+# ---------------------------------------------------------------------------
+
+def _usage_anthropic(usage):
+    return {"input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0}
+
+
+def _usage_openai(usage):
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", 0) or 0
+    return {"input_tokens": max((getattr(usage, "prompt_tokens", 0) or 0) - cached, 0),
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "cache_read_tokens": cached,
+            "cache_write_tokens": 0}
+
+
+def _cost(model, usage):
+    price = PRICES.get(model)
+    if not price or not usage:
+        return None
+    return round((usage["input_tokens"] * price[0] + usage["output_tokens"] * price[1]
+                  + usage["cache_read_tokens"] * price[2]
+                  + usage["cache_write_tokens"] * price[3]) / 1_000_000, 6)
+
+
+def _record(trace, step, provider, model, usage, started, error=None):
+    if trace is not None:
+        trace.llm(step, provider, model, usage, _cost(model, usage), started, error)
+
+
+# ---------------------------------------------------------------------------
+# Provider calls
+# ---------------------------------------------------------------------------
+
 def _anthropic_system(system):
     if isinstance(system, str):
         return system
@@ -86,6 +139,7 @@ def _flat_system(system):
 
 
 def _call(provider, system, messages, max_tokens, models):
+    """One non-streaming call. Returns (text, usage)."""
     global last_cache_read_tokens
     client = _client(provider)
     if provider == "anthropic":
@@ -95,8 +149,9 @@ def _call(provider, system, messages, max_tokens, models):
             resp = client.messages.create(temperature=0, **kwargs)
         except TypeError:
             resp = client.messages.create(**kwargs)
-        last_cache_read_tokens = getattr(resp.usage, "cache_read_input_tokens", 0) or 0
-        return "".join(b.text for b in resp.content if b.type == "text")
+        usage = _usage_anthropic(resp.usage)
+        last_cache_read_tokens = usage["cache_read_tokens"]
+        return "".join(b.text for b in resp.content if b.type == "text"), usage
 
     kwargs = dict(model=models[provider], max_tokens=max_tokens,
                   messages=[{"role": "system", "content": _flat_system(system)}] + messages)
@@ -104,10 +159,11 @@ def _call(provider, system, messages, max_tokens, models):
         resp = client.chat.completions.create(temperature=0, **kwargs)
     except TypeError:
         resp = client.chat.completions.create(**kwargs)
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content, _usage_openai(getattr(resp, "usage", None))
 
 
-def _stream_call(provider, system, messages, max_tokens, models):
+def _stream_call(provider, system, messages, max_tokens, models, usage_out):
+    """Streaming call. Yields text pieces; fills usage_out when the stream completes."""
     client = _client(provider)
     if provider == "anthropic":
         kwargs = dict(model=models[provider], max_tokens=max_tokens,
@@ -119,15 +175,22 @@ def _stream_call(provider, system, messages, max_tokens, models):
         with manager as stream:
             for text in stream.text_stream:
                 yield text
+            try:
+                usage_out.update(_usage_anthropic(stream.get_final_message().usage))
+            except Exception:
+                pass
         return
 
     kwargs = dict(model=models[provider], max_tokens=max_tokens, stream=True,
+                  stream_options={"include_usage": True},
                   messages=[{"role": "system", "content": _flat_system(system)}] + messages)
     try:
         stream = client.chat.completions.create(temperature=0, **kwargs)
     except TypeError:
         stream = client.chat.completions.create(**kwargs)
     for chunk in stream:
+        if getattr(chunk, "usage", None):
+            usage_out.update(_usage_openai(chunk.usage) or {})
         if chunk.choices and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
@@ -139,31 +202,37 @@ def _providers():
     return order
 
 
-def _chat(system, messages, max_tokens=2000, models=None):
+def _chat(system, messages, max_tokens=2000, models=None, trace=None, step="llm"):
     global last_provider
     models = models or MODELS
     last_error = None
     for provider in _providers():
+        started = time.time()
         try:
-            text = _call(provider, system, messages, max_tokens, models)
+            text, usage = _call(provider, system, messages, max_tokens, models)
             if provider != PRIMARY:
                 log.warning("Primary provider failed; served by fallback '%s'", provider)
             last_provider = provider
+            _record(trace, step, provider, models[provider], usage, started)
             return text
         except Exception as e:
+            _record(trace, step, provider, models[provider], None, started,
+                    error=f"{type(e).__name__}: {e}"[:300])
             last_error = e
             log.warning("LLM provider '%s' failed: %s", provider, e)
     raise LLMUnavailable(str(last_error)) from last_error
 
 
-def _stream(system, messages, max_tokens=600, models=None):
+def _stream(system, messages, max_tokens=600, models=None, trace=None, step="llm"):
     global last_provider
     models = models or MODELS
     last_error = None
     for provider in _providers():
+        started_at = time.time()
+        usage = {}
         started = False
         try:
-            for piece in _stream_call(provider, system, messages, max_tokens, models):
+            for piece in _stream_call(provider, system, messages, max_tokens, models, usage):
                 if not started:
                     started = True
                     last_provider = provider
@@ -171,8 +240,11 @@ def _stream(system, messages, max_tokens=600, models=None):
                         log.warning("Primary provider failed; streaming from fallback '%s'",
                                     provider)
                 yield piece
+            _record(trace, step, provider, models[provider], usage or None, started_at)
             return
         except Exception as e:
+            _record(trace, step, provider, models[provider], usage or None, started_at,
+                    error=f"{type(e).__name__}: {e}"[:300])
             if started:
                 raise
             last_error = e
@@ -188,9 +260,9 @@ def _parse_json(text):
     return json.loads(text[start:end + 1])
 
 
-def _chat_json(system, messages):
+def _chat_json(system, messages, trace=None, step="plan"):
     """JSON call with ONE automatic retry if the model's output isn't valid JSON."""
-    text = _chat(system, messages)
+    text = _chat(system, messages, trace=trace, step=step)
     try:
         return _parse_json(text)
     except ValueError:                       # json.JSONDecodeError is a ValueError too
@@ -200,7 +272,7 @@ def _chat_json(system, messages):
             {"role": "user", "content": "That response was not valid JSON. Reply again with "
                                         "ONLY the JSON object in the required format."},
         ]
-        return _parse_json(_chat(system, retry))
+        return _parse_json(_chat(system, retry, trace=trace, step=f"{step}_json_retry"))
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +421,11 @@ def _system_prompt(user, periods):
     return (static, _schema(user, periods))
 
 
-def plan(user, messages, periods):
-    return _chat_json(_system_prompt(user, periods), messages)
+def plan(user, messages, periods, trace=None):
+    return _chat_json(_system_prompt(user, periods), messages, trace=trace, step="plan")
 
 
-def resolve(user, messages, periods, prior_plan, lookup, matches_by_term, note=""):
+def resolve(user, messages, periods, prior_plan, lookup, matches_by_term, note="", trace=None):
     """Second (and last) hop: continue after a name lookup, resolving EVERY search term
     together in one call. `matches_by_term` = {term: [matches]}.
     `note` explains WHY the lookup happened (e.g. the backstop: a guessed name returned 0 rows)."""
@@ -377,10 +449,10 @@ def resolve(user, messages, periods, prior_plan, lookup, matches_by_term, note="
             "their access, with rephrasing options.\n"
             "- If every term resolves: write ONE final query covering all of them.")},
     ]
-    return _chat_json(_system_prompt(user, periods), convo)
+    return _chat_json(_system_prompt(user, periods), convo, trace=trace, step="resolve")
 
 
-def repair(user, messages, periods, failures):
+def repair(user, messages, periods, failures, trace=None):
     """Retry with the FULL history of failed attempts."""
     convo = list(messages)
     for i, f in enumerate(failures, 1):
@@ -391,10 +463,11 @@ def repair(user, messages, periods, failures):
             f"Attempt {i} failed with this error:\n{f['error']}\n\n{hint}"
             "Fix the query and return the same JSON format. If the question cannot be "
             "answered with the available data, return action 'refuse' and explain why.")})
-    return _chat_json(_system_prompt(user, periods), convo)
+    return _chat_json(_system_prompt(user, periods), convo, trace=trace,
+                      step=f"repair_{len(failures)}")
 
 
-def explain_failure(user, messages, periods, reason):
+def explain_failure(user, messages, periods, reason, trace=None):
     """Last resort before giving up: turn a technical failure into a plain-language
     explanation plus answerable alternative questions. The model sees the technical
     reason; the USER never does."""
@@ -411,7 +484,7 @@ def explain_failure(user, messages, periods, reason):
     )
     convo = list(messages[:-1]) + [
         {"role": "user", "content": messages[-1]["content"] + note}]
-    return _chat_json(_system_prompt(user, periods), convo)
+    return _chat_json(_system_prompt(user, periods), convo, trace=trace, step="explain_failure")
 
 
 # ---------------------------------------------------------------------------
@@ -464,14 +537,15 @@ def _answer_messages(question, summary, result, periods, feedback=None):
     return [{"role": "user", "content": json.dumps(payload, default=str)}]
 
 
-def answer(question, summary, result, periods, feedback=None):
+def answer(question, summary, result, periods, feedback=None, trace=None):
     return _chat(ANSWER_RULES, _answer_messages(question, summary, result, periods, feedback),
-                 max_tokens=600, models=ANSWER_MODELS).strip()
+                 max_tokens=600, models=ANSWER_MODELS, trace=trace,
+                 step="correct_answer" if feedback else "answer").strip()
 
 
-def answer_stream(question, summary, result, periods):
+def answer_stream(question, summary, result, periods, trace=None):
     yield from _stream(ANSWER_RULES, _answer_messages(question, summary, result, periods),
-                       max_tokens=600, models=ANSWER_MODELS)
+                       max_tokens=600, models=ANSWER_MODELS, trace=trace, step="answer")
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +562,8 @@ automatically limited to the user's access. Describe ONLY what is in the query; 
 anything. Plain text only: no headings, no bold, no code."""
 
 
-def explain_sql(sql, summary):
+def explain_sql(sql, summary, trace=None):
     """Plain-English, step-by-step explanation of a query the user explicitly asked to see."""
     payload = json.dumps({"sql": sql, "description": summary or ""})
     return _chat(EXPLAIN_SQL_RULES, [{"role": "user", "content": payload}],
-                 max_tokens=400, models=ANSWER_MODELS).strip()
+                 max_tokens=400, models=ANSWER_MODELS, trace=trace, step="explain_sql").strip()

@@ -11,6 +11,12 @@ One chat turn, end to end, as a STREAM OF EVENTS:
 
 ask() consumes the same stream and returns only the final result.
 
+AGENT TRACE (app/trace.py): every LLM call (model, tokens, cost, latency, error), every tool call
+(execute_sql, lookup_names, backstop_lookup, verify_numbers: parameters, result summary,
+latency, error), and every agent decision (action + planner reasoning) is recorded as a step.
+The single JSON log line per request carries the steps plus rolled-up metrics: total steps,
+LLM calls, tool calls, tokens, estimated cost, errors, latency.
+
 SQL ON REQUEST (README: "no SQL, no technical details visible to the user unless they ask"):
   SQL is never shown by default. If the user explicitly asks ("show me the SQL", "what query
   did you run?"), the pipeline returns the EXACT query behind their previous answer, taken from
@@ -55,6 +61,7 @@ import uuid
 from collections import OrderedDict
 
 from . import db, llm, security, verify
+from .trace import Trace
 
 log = logging.getLogger("nl2sql")
 
@@ -300,12 +307,19 @@ def _status(stage, **extra):
     return {"type": "status", "stage": stage, **extra}
 
 
+def _decision(tr, plan):
+    """Record an agent decision (action + planner reasoning) in the trace."""
+    tr.event("decision", action=plan.get("action"), reasoning=plan.get("reasoning"),
+             summary=plan.get("summary") or None)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 def ask_stream(user, question, history=None):
     rid = uuid.uuid4().hex[:8]
     t0 = time.time()
+    tr = Trace()
     history = history or []
     messages = history + [{"role": "user", "content": question}]
     periods = db.get_periods()
@@ -325,7 +339,8 @@ def ask_stream(user, question, history=None):
             _cache_put(key, result)
         log.info(json.dumps({
             "request_id": rid, "user_id": user["user_id"], "role": user["role"],
-            "question": question, "kind": result["kind"], "sql": result.get("sql"),
+            "question": question, "answer": (result.get("answer") or "")[:2000],
+            "kind": result["kind"], "sql": result.get("sql"),
             "rows": len(result["rows"]), "repair_attempts": len(failures),
             "failure_errors": [f["error"] for f in failures],
             "lookup_hops": hops["used"], "lookup": flags["lookup"],
@@ -338,6 +353,8 @@ def ask_stream(user, question, history=None):
             "timings_ms": timings,
             "latency_ms": int((time.time() - t0) * 1000), "error": error,
             "provider": llm.last_provider,
+            "metrics": tr.summary(),
+            "steps": tr.steps,
         }, default=str))
         return {"type": "done", "result": result}
 
@@ -357,7 +374,7 @@ def ask_stream(user, question, history=None):
     def explain_and_suggest(reason, sql=None):
         """Last resort: plain-language explanation + answerable alternatives (clickable)."""
         try:
-            exp = llm.explain_failure(user, messages, periods, reason)
+            exp = llm.explain_failure(user, messages, periods, reason, trace=tr)
             message = _tidy(exp.get("message"))
             options = _options(exp)
             if message:
@@ -373,12 +390,15 @@ def ask_stream(user, question, history=None):
     # plus a plain-English explanation of what it does.
     if is_sql_request(question):
         last_sql, why = last_sql_turn(history)
+        tr.event("decision", action="show_sql", reasoning="explicit request to see the SQL; "
+                 + ("returning the previous query from history" if last_sql
+                    else "no previous query in this conversation"))
         if not last_sql:
             yield done(_result(NO_SQL_YET, "clarify", options=_default_options(user)))
             return
         yield _status("explaining")
         try:
-            steps = _tidy(llm.explain_sql(last_sql[:4000], why))
+            steps = _tidy(llm.explain_sql(last_sql[:4000], why, trace=tr))
         except Exception:
             steps = ""
         text = "Here's the exact query behind my previous answer, and what it does:"
@@ -391,6 +411,7 @@ def ask_stream(user, question, history=None):
         cached = _cache_get(key)
         if cached:
             flags["cache_hit"] = True
+            tr.event("cache_hit", kind=cached["kind"])
             if cached["kind"] == "query":
                 yield {"type": "data", "sql": cached["sql"], "columns": cached["columns"],
                        "rows": cached["rows"], "truncated": cached["truncated"]}
@@ -402,8 +423,9 @@ def ask_stream(user, question, history=None):
     yield _status("understanding")
     started = time.time()
     try:
-        plan = llm.plan(user, messages, periods)
+        plan = llm.plan(user, messages, periods, trace=tr)
         flags["plan_cache_read_tokens"] = llm.last_cache_read_tokens
+        _decision(tr, plan)
     except Exception as e:
         yield unexpected(e)
         return
@@ -418,16 +440,21 @@ def ask_stream(user, question, history=None):
             return
         yield _status("looking_up", term=", ".join(terms))
         try:
+            started_l = time.time()
             matches_by_term = {t: db.lookup_entities(user, kind, t) for t in terms}
+            tr.tool("lookup_names", {"kind": kind, "terms": terms}, started_l,
+                    result={t: len(m) for t, m in matches_by_term.items()})
             hops["used"] += 1
             flags["lookup"] = {"trigger": "planner", "terms": terms,
                                "matches": {t: len(m) for t, m in matches_by_term.items()}}
             plan = llm.resolve(user, messages, periods, plan,
-                               {"kind": kind, "terms": terms}, matches_by_term)
+                               {"kind": kind, "terms": terms}, matches_by_term, trace=tr)
+            _decision(tr, plan)
         except Exception as e:
             yield unexpected(e)
             return
         if plan.get("action") == "lookup":             # a 2nd hop is not allowed
+            tr.event("hop_cap", reasoning="a second lookup hop was requested; not allowed")
             plan = {"action": "clarify", "message": UNCLEAR_MESSAGE, "options": []}
     mark("plan_ms", started)
 
@@ -455,8 +482,17 @@ def ask_stream(user, question, history=None):
                 return
             tried.add(norm)
 
+            started_q = time.time()
             try:
-                data = db.run_query(sql, user)
+                try:
+                    data = db.run_query(sql, user)
+                except Exception as e:
+                    tr.tool("execute_sql", {"sql": sql}, started_q,
+                            error=f"{type(e).__name__}: {e}"[:300])
+                    raise
+                tr.tool("execute_sql", {"sql": sql}, started_q,
+                        result={"rows": len(data["rows"]), "columns": data["columns"],
+                                "truncated": data["truncated"]})
                 break
             except security.WacRestricted:
                 yield done(_result(WAC_MESSAGE, "refuse"))
@@ -481,7 +517,8 @@ def ask_stream(user, question, history=None):
             failures.append({"plan": plan, "error": error})
             yield _status("fixing", attempt=len(failures))
             try:
-                plan = llm.repair(user, messages, periods, failures)
+                plan = llm.repair(user, messages, periods, failures, trace=tr)
+                _decision(tr, plan)
             except Exception as e:
                 yield unexpected(e, sql)
                 return
@@ -497,7 +534,11 @@ def ask_stream(user, question, history=None):
             break
 
         try:
+            started_b = time.time()
             found = backstop_lookup(user, guessed)
+            tr.tool("backstop_lookup", {"guessed": guessed}, started_b,
+                    result={n: {"exists": e["exists"], "matches": len(e["matches"])}
+                            for n, e in found.items()})
         except Exception:
             break                                       # backstop can only help, never hurt
         hops["used"] += 1
@@ -518,7 +559,8 @@ def ask_stream(user, question, history=None):
         try:
             new_plan = llm.resolve(user, messages, periods, plan,
                                    {"kind": "organization", "terms": terms},
-                                   matches_by_term, note=note)
+                                   matches_by_term, note=note, trace=tr)
+            _decision(tr, new_plan)
         except Exception:
             break                                       # can't resolve: answer with the empty result
 
@@ -541,7 +583,7 @@ def ask_stream(user, question, history=None):
     started = time.time()
     try:
         pieces = []
-        for piece in llm.answer_stream(question, summary, data, periods):
+        for piece in llm.answer_stream(question, summary, data, periods, trace=tr):
             pieces.append(piece)
             yield {"type": "delta", "text": piece}
         text = _tidy("".join(pieces))
@@ -550,16 +592,24 @@ def ask_stream(user, question, history=None):
         # 4. Verify every number
         yield _status("verifying")
         started = time.time()
+        started_v = time.time()
         bad = verify.unverified_numbers(text, data, question, summary, periods)
+        tr.tool("verify_numbers", {"answer_chars": len(text)}, started_v,
+                result={"unverified": bad})
         flags["unverified_first"].extend(bad)
         if bad:
             flags["corrected"] = True
-            text = _tidy(llm.answer(question, summary, data, periods, feedback=bad))
+            text = _tidy(llm.answer(question, summary, data, periods, feedback=bad, trace=tr))
+            started_v = time.time()
             bad = verify.unverified_numbers(text, data, question, summary, periods)
+            tr.tool("verify_numbers", {"answer_chars": len(text), "attempt": 2}, started_v,
+                    result={"unverified": bad})
         if bad:
             text, flags["safe"] = _safe_answer(summary), True
+            tr.event("safe_fallback", reasoning="answer still contained unverified numbers")
         mark("verify_ms", started)
-    except Exception:
+    except Exception as e:
+        tr.event("answer_error", error=f"{type(e).__name__}: {e}"[:300])
         text, flags["safe"] = _safe_answer(summary), True   # table still shown: the data is intact
 
     yield done(_result(text, "query", sql, data, verified=True, summary=summary,

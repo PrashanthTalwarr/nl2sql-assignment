@@ -34,7 +34,7 @@ check("Extracts the summary", why == "Top accounts this quarter.", why)
 
 # End to end, with the explainer stubbed out (no LLM)
 real_explain = llm.explain_sql
-llm.explain_sql = lambda sql, summary: "- Counts paid sales\n- Ranks accounts"
+llm.explain_sql = lambda sql, summary, **kw: "- Counts paid sales\n- Ranks accounts"
 try:
     r = pipeline.ask(EXEC, "show me the SQL", history)
     check("Returns kind 'sql' with the exact query", r["kind"] == "sql" and r["sql"] == "SELECT 1 AS x")
