@@ -30,7 +30,7 @@ as a RAM: "Compare all territories" or "What is my revenue in dollars?"
 
 | | |
 |---|---|
-| **Evaluation** | **36/36** cases pass (6 categories, 5 rubric dimensions, 18 with execution accuracy against reference SQL). The first run scored 30/36 and found real defects, which were fixed |
+| **Evaluation** | **34/36** on the final run (both failures are evaluator false negatives on manual review, answers correct: see `evals/results_final.md`). Earlier runs: 30/36 → 36/36 |
 | **Security** | 0 scope or pricing leaks; 13/13 deterministic security checks; all 6 scenarios in `docs/security_model.md` covered |
 | **Other suites** | API 12/12 · name-lookup backstop 15/15 · SQL-on-request 12/12 |
 | **Latency** | Median 8.4s, p95 16.2s; the result table appears before the answer text |
