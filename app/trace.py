@@ -15,7 +15,7 @@ class Trace:
         self.t0 = time.time()
         self.steps = []
 
-    def _add(self, kind, name, started=None, **data):
+    def _add(self, kind, name, started=None, /, **data):
         now = time.time()
         step = {"n": len(self.steps) + 1, "type": kind, "name": name,
                 "start_ms": int(((started or now) - self.t0) * 1000)}
