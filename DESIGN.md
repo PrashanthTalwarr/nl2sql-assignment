@@ -7,12 +7,13 @@ against the query result in code** before it is shown.
 
 | | |
 |---|---|
-| **Live URL** | http://35.90.30.116|
+| **Live URL** | http://35.90.30.116 |
 | **Stack** | FastAPI · SQLite (read-only, in the image) · Claude Sonnet (planner) + Claude Haiku (answers) · AWS EC2 (Docker) + ECR + CloudWatch |
 | **Agent design** | Bounded workflow agent: the LLM makes the judgment calls (plan, look up, clarify, refuse); code enforces every limit (security, hop and retry budgets, number verification) |
 | **Priorities** | **Accuracy > latency > cost**, and security never depends on the LLM |
 | **Evaluation** | **36/36** cases pass across 6 categories and 5 rubric dimensions. The first run scored 30/36 and found real defects, which were fixed. See [`evals/results_final.md`](evals/results_final.md) and [`TEST_RESULTS.md`](TEST_RESULTS.md) |
 | **Security** | 0 scope or pricing leaks across all eval cases; 13/13 deterministic security checks |
+| **Observability** | Full agent trace per request: every LLM call (tokens, cost, latency) and tool call (parameters, result, latency), plus the planner's reasoning; typically about **$0.01–0.03 per question** |
 | **Latency** | Median 8.4s, p95 16.2s per question; the results table appears before the answer text |
 
 > The UI is branded "Avyxa Pharma Analytics" for this take-home assessment. It is not an official Avyxa product.
@@ -55,7 +56,7 @@ principle higher in this list won.
 | 5 | **Single-hop by default, multi-hop only when the question needs it** | Most questions are answered by one SQL query (joins and CTEs do the multi-step work). A second hop runs only for uncertain organization names, capped at one hop per question |
 | 6 | **Default before asking** | Vague questions get a sensible default with the assumption stated; the agent clarifies only when a guess would probably be wrong |
 | 7 | **Honest over impressive** | Market share above 100% is explained, not hidden; partial periods are flagged; limitations are documented next to the scores |
-| 8 | **Measure before optimizing** | Per-stage timings showed the LLM, not the database, was the bottleneck; the eval, not intuition, decided which fixes to make |
+| 8 | **Measure before optimizing** | Per-step traces showed the LLM, not the database, was the bottleneck; the eval, not intuition, decided which fixes to make |
 
 ---
 
@@ -86,14 +87,15 @@ flowchart LR
     T --> V["Per-request TEMP views scoped to the user"]
     V --> DB[("SQLite, read-only, 2M rows")]
     A -->|"verify"| VF["Number verifier, in code"]
-    API -->|"one JSON log line per request"| CW["CloudWatch Logs"]
+    API -->|"one JSON trace per request"| CW["CloudWatch Logs"]
 ```
 
 | File | Responsibility |
 |---|---|
 | `app/main.py` | HTTP API: login, signed sessions, validation, rate limiting, streaming endpoint (NDJSON), static UI |
 | `app/pipeline.py` | **The agent**: one chat turn as a bounded state machine that emits a stream of events; failure handling; answer cache; logging |
-| `app/llm.py` | Provider layer (Anthropic/OpenAI, retries, failover) and every prompt: plan, resolve, repair, answer, explain failure, explain SQL |
+| `app/llm.py` | Provider layer (Anthropic/OpenAI, retries, failover), token usage and cost, and every prompt: plan, resolve, repair, answer, explain failure, explain SQL |
+| `app/trace.py` | Per-request agent trace: every LLM call, tool call, and decision as a step, rolled up into metrics |
 | `app/security.py` | Scoped TEMP views, SQL guard, error types |
 | `app/db.py` | The agent's tools: read-only execution with timeout and row cap, scoped name lookup, period and reference data |
 | `app/verify.py` | Deterministic number grounding check |
@@ -268,6 +270,12 @@ Exec's total omitted pricing, contradicting the security spec; a fallback answer
 information; and the backstop missed aggregate queries that return `[[None]]`. Each fix was
 backed by evidence in the report, and the final run passed 36/36 (section 12).
 
+### 4.12 Observable by design
+
+Every step of the state machine is traced: each LLM call with its tokens and cost, each tool call
+with its parameters, result, and latency, and each decision with the planner's reasoning. A
+request can be replayed step by step from its log line alone (section 11).
+
 ---
 
 ## 5. Database choice and rationale
@@ -329,8 +337,8 @@ Domain knowledge enters in **five layers**:
 | Technique | Why |
 |---|---|
 | **Structured JSON contract** (`reasoning`, `action`, `sql`, `lookup`, `summary`, `message`, `options`) with one retry on malformed JSON | Machine-checkable decisions (section 4.3) |
-| **Short reasoning field (2–4 sentences)** before the SQL | Lightweight chain-of-thought. A shorter version was rejected: about 1s saved, at an accuracy risk |
-| **Static/dynamic split with prompt caching** | Rules, reference data, and docs (~9.5K tokens) form an identical cached prefix; the user's schema, scope, and periods go last. Warm planning **8.7s vs 17.5s cold** |
+| **Short reasoning field (2–4 sentences)** before the SQL | Lightweight chain-of-thought, also logged in the trace. A shorter version was rejected: about 1s saved, at an accuracy risk |
+| **Static/dynamic split with prompt caching** | Rules, reference data, and docs (~9.7K tokens) form an identical cached prefix; the user's schema, scope, and periods go last. Warm planning **8.7s vs 17.5s cold** |
 | **Plain-language `summary`** | Shown in "How I got this"; SQL, table, and column names are forbidden in it |
 | **Ambiguity policy in a fixed order** | Default and state the assumption → look up uncertain names → clarify only if a guess would probably be wrong |
 | **Scope honesty** | The planner knows the tables are already filtered; if a RAM asks to "compare all territories," the answer says only their territory is visible |
@@ -364,7 +372,7 @@ flowchart TB
 - **Mock login** with three demo users: Exec (U001), Director of the Northeast (U003), RAM for New York Metro (U009). Only these IDs can log in.
 - **HMAC-signed session token** (`itsdangerous`, 8-hour expiry, secret from the environment). Tampered or forged tokens are rejected (401).
 - **Identity resolves server-side** from the `users` table on every request.
-- **Validation:** length limits; history may contain only `user` and `assistant` turns (an injected `system` turn is rejected, 422); **rate limit** 20 questions per minute per user (429).
+- **Validation:** length limits; history may contain only `user` and `assistant` turns (an injected `system` turn is rejected, 422); a **per-user rate limit** (configurable; 60 questions per minute in the deployment) returns 429.
 
 ### Row-level security
 
@@ -430,11 +438,11 @@ A single `SELECT`/`WITH` statement; no write or DDL keywords (`INSERT/UPDATE/DEL
 | **Amazon ECR** | Stores the container image (app + read-only database) | Private, versioned images; the EC2 instance pulls them with its IAM role |
 | **Amazon EC2** (t3.small, Amazon Linux 2023) | Runs the Docker container on port 80, with `--restart unless-stopped` and a container health check | The same image that was tested locally runs unchanged; fewest moving parts for a single container |
 | **IAM instance role** | Grants the instance ECR pull and CloudWatch write access | **No AWS keys stored on the server** |
-| **Amazon CloudWatch Logs** | Receives the app's JSON logs through Docker's `awslogs` driver (log group `/nl2sql-pharma`) | Queryable with Logs Insights (section 11) |
+| **Amazon CloudWatch Logs** | Receives the app's JSON traces through Docker's `awslogs` driver (log group `/nl2sql-pharma`) | Queryable with Logs Insights (section 11) |
 
 **Why EC2 and not App Runner:** App Runner, the original choice (managed HTTPS and scaling for one container), **stopped accepting new customers on April 30, 2026**. The container was designed to be platform-neutral, so it moved to EC2 without code changes; it would also run unchanged on ECS Fargate or ECS Express Mode.
 
-**Container:** `python:3.12-slim`, pinned runtime dependencies, non-root user, health check, `uvicorn` on port 8080. `.dockerignore` keeps `.env`, the virtual environment, raw CSVs, scripts, and eval files out of the image.
+**Container:** `python:3.12-slim`, pinned runtime dependencies, non-root user, health check, `uvicorn` on port 8080. `.dockerignore` keeps `.env`, the virtual environment, raw CSVs, scripts, and eval files out of the image. Each release is a separately tagged image (`latest`, `v2`), so rolling back is one command.
 
 **Secrets:** API keys and the session secret live in an owner-only file on the instance (`chmod 600`), passed to the container as environment variables; never in the image or repository. In production: AWS Secrets Manager.
 
@@ -452,27 +460,53 @@ A single `SELECT`/`WITH` statement; no write or DDL keywords (`INSERT/UPDATE/DEL
 
 ## 11. Observability
 
-Every request emits **one structured JSON log line** covering each step of the agent: user and role, question, generated SQL, rows, repair attempts and errors, lookup hops and trigger (planner vs. backstop), verification results (numbers caught, corrected, safe fallback), cache hits, prompt-cache tokens, **per-stage timings**, total latency, provider, and errors. Internal errors also log a full traceback.
+Every request emits **one structured JSON log line** containing a full **agent trace** (`app/trace.py`). Each LLM call, tool call, and agent decision is recorded as a step:
+
+| Step type | Recorded |
+|---|---|
+| `llm` | Step name (plan, resolve, repair, answer, correct_answer, explain_sql, explain_failure), provider, model, **input / output / cache-read / cache-write tokens**, **estimated cost**, latency, error |
+| `tool` | `execute_sql` (SQL → rows, columns, truncated), `lookup_names` (terms → match counts), `backstop_lookup`, `verify_numbers` (unverified numbers), each with latency and error |
+| `event` | Agent decisions (the action chosen and the **planner's reasoning**), cache hits, hop-cap and safe-fallback events |
+
+The line also carries the user and role, the question, the answer, the final SQL, repair and lookup details, per-stage timings, and rolled-up **metrics**: total steps, LLM calls, tool calls, tokens, cost, errors, and latency. Internal errors also log a full traceback.
+
+A real trace from the deployed app (question: "How is Memorial Medical Alliance doing?"):
 
 ```json
-{"request_id": "96f7a1df", "user_id": "U001", "role": "exec",
- "question": "What is our market share for Zenovax in the Docetaxel market?",
- "kind": "query", "rows": 1, "repair_attempts": 0, "lookup_hops": 0,
- "verified": true, "unverified_numbers": [], "corrected": false, "safe_answer_used": false,
- "cache_hit": false, "plan_cache_read_tokens": 9516,
- "timings_ms": {"plan_ms": 8672, "query_ms": 2246, "answer_ms": 1717, "verify_ms": 0},
- "latency_ms": 12640, "error": null, "provider": "anthropic"}
+"metrics": {"steps": 8, "llm_calls": 3, "tool_calls": 3, "input_tokens": 2159, "output_tokens": 1123,
+            "cache_read_tokens": 19348, "cache_write_tokens": 0, "cost_usd": 0.025912, "errors": 0, "latency_ms": 19060},
+"steps": [
+  {"n": 1, "type": "llm",   "name": "plan", "model": "claude-sonnet-4-6", "latency_ms": 3146, "cost_usd": 0.006232},
+  {"n": 2, "type": "event", "name": "decision", "action": "lookup",
+   "reasoning": "This is an organization name I should look up rather than guess..."},
+  {"n": 3, "type": "tool",  "name": "lookup_names", "latency_ms": 47,
+   "params": {"kind": "organization", "terms": ["Memorial Medical Alliance"]}, "result": {"Memorial Medical Alliance": 1}},
+  {"n": 4, "type": "llm",   "name": "resolve", "model": "claude-sonnet-4-6", "latency_ms": 12785, "cost_usd": 0.018073},
+  {"n": 5, "type": "event", "name": "decision", "action": "query",
+   "reasoning": "Exactly one match ... compare current quarter vs previous quarter by product ..."},
+  {"n": 6, "type": "tool",  "name": "execute_sql", "latency_ms": 807, "result": {"rows": 1, "truncated": false}},
+  {"n": 7, "type": "llm",   "name": "answer", "model": "claude-haiku-4-5-20251001", "latency_ms": 2269, "cost_usd": 0.001607},
+  {"n": 8, "type": "tool",  "name": "verify_numbers", "latency_ms": 0, "result": {"unverified": []}}
+]
 ```
+
+A typical question costs **about $0.01–0.03**. The first request after a deploy costs more (about $0.05) because it **writes** the ~9.7K-token prompt cache; later requests **read** it. The trace also shows which step dominates latency (here, the resolve call).
 
 **CloudWatch Logs Insights queries:**
 ```
-stats avg(latency_ms), pct(latency_ms, 95), count(*) by role
+filter ispresent(request_id) and ispresent(metrics.steps)
+| stats count(*) as questions, avg(metrics.cost_usd) as avg_cost, sum(metrics.cost_usd) as total_cost,
+        avg(latency_ms) as avg_ms, pct(latency_ms, 95) as p95_ms by role
+
+filter ispresent(request_id) and ispresent(metrics.steps)
+| stats avg(metrics.steps) as steps, avg(metrics.llm_calls) as llm_calls, avg(metrics.tool_calls) as tool_calls by kind
+
 filter corrected = 1 or safe_answer_used = 1 | stats count(*)
 filter lookup.trigger = "backstop" | stats count(*)
-filter kind = "error" | stats count(*) by error
+filter metrics.errors > 0 | fields @timestamp, question, error
 ```
 
-The who-asked-what and what-SQL-ran record doubles as an **audit trail** for access-control review. **Not logged, on purpose:** API keys, tokens, raw result rows, full prompts. **Gap:** tokens and estimated cost per request (section 17).
+The who-asked-what and what-SQL-ran record doubles as an **audit trail** for access-control review. **Not logged, on purpose:** API keys, session tokens, raw result rows, full prompts. Costs are estimates from list prices in `app/llm.py` (`PRICES`).
 
 ---
 
@@ -517,12 +551,12 @@ The who-asked-what and what-SQL-ran record doubles as an **audit trail** for acc
 | Verification | < 1ms |
 | **End to end** | **median 8.4s, p95 16.2s** |
 
-LLM generation accounts for 80–90% of latency.
+LLM generation accounts for 80–90% of latency (confirmed per step in the trace).
 
-**Accepted, because they cost no accuracy:** prompt caching of the ~9.5K-token static prefix; streaming with the table first; a per-user answer cache; model tiering.
+**Accepted, because they cost no accuracy:** prompt caching of the ~9.7K-token static prefix; streaming with the table first; a per-user answer cache; model tiering.
 **Rejected, because they trade away accuracy:** a smaller planner model (roughly halves planning time, but risks errors on multi-source SQL like market share) and a shorter reasoning field.
 
-**Cost profile:** two LLM calls per typical question, with the planner's static prompt cached; at most 7 by construction. Infrastructure is a single App Runner instance.
+**Cost profile (measured from traces):** a typical question is two LLM calls and costs **about $0.01**; a question with a name lookup is three calls and about **$0.03**; the first request after a deploy is about **$0.05** because it writes the prompt cache. At most 7 LLM calls by construction. Infrastructure is a single t3.small EC2 instance.
 
 ---
 
@@ -545,11 +579,12 @@ LLM generation accounts for 80–90% of latency.
 | Ambiguity | Default → lookup → clarify | Always clarify / always guess | Fast answers with stated assumptions; asks only when needed |
 | SQL visibility | Hidden; shown on explicit request | Always / never | Matches "no SQL unless they ask" |
 | Failures | Explain + suggest; classified errors | Generic errors | No dead ends; no internals leaked |
+| Observability | Structured per-request trace in the existing log line | A tracing platform (OpenTelemetry, LangSmith) | Zero extra infrastructure, queryable in CloudWatch today; the same steps can be exported to a tracing backend later |
 | Auth | Mock login + signed tokens | Real identity provider | In scope; identity still can't be forged |
 | Evaluation | Execution accuracy + cross-family judge + deterministic caps | Judge-only | Code checks what code can check |
 | Deployment | EC2 + Docker (same image as local) | ECS / EKS / Lambda | App Runner closed to new customers; EC2 is the fewest moving parts for one container, and the image runs unchanged on ECS |
 
-**Considered and deliberately not built:** a keyword pre-check that refuses pricing questions before any LLM call (a cost optimization only; security doesn't depend on it); a semantic catalog in code (maintainability, with no accuracy gain); long-term memory; OpenTelemetry tracing (single service); in-app live evaluations (anyone with the URL could spend API credits, and it needs background-job infrastructure).
+**Considered and deliberately not built:** a keyword pre-check that refuses pricing questions before any LLM call (a cost optimization only; security doesn't depend on it); a semantic catalog in code (maintainability, with no accuracy gain); long-term memory; in-app live evaluations (anyone with the URL could spend API credits, and it needs background-job infrastructure).
 
 ---
 
@@ -563,6 +598,7 @@ LLM generation accounts for 80–90% of latency.
 | **A wrong answer is worse than no answer** | When a written answer can't be verified, the user gets a grounded summary and the exact table instead; the verified badge only appears after verification |
 | **Most questions are answerable with one query** | Single-hop by default; multi-hop reserved for uncertain names, capped at one hop per question |
 | **The LLM will occasionally be wrong or manipulated** | Security enforced in views and a guard; budgets enforced in code; a backstop catches planner misses |
+| **An agent in production must be observable** | Every LLM call, tool call, and decision is traced with tokens, cost, and latency |
 | **Users are non-technical sales and analytics staff** | Plain-language answers and reasoning, no SQL unless asked, defaults with stated assumptions, clickable options instead of open questions |
 | **Latency of ~10s is acceptable if progress is visible** | Streaming, live progress line, results table before the answer text |
 | **Analytics conversations are short** (a handful of related questions) | 10-turn memory without summarization |
@@ -591,7 +627,8 @@ LLM generation accounts for 80–90% of latency.
 - **Safe fallback frequency:** a few answers (e.g. N-8, E-7) fall back to a grounded summary after failing verification twice.
 - **Temperature:** the installed SDK rejects the parameter, so runs aren't guaranteed identical.
 - **Per-instance state:** the rate limiter and answer cache are in memory; with more than one instance, each keeps its own. At scale: Redis/ElastiCache.
-- **Concurrency in metrics:** "last provider" and "last cache tokens" are module-level variables and can be misattributed in logs under concurrent requests. Answers and security are unaffected.
+- **Concurrency in legacy log fields:** the older `provider` and `plan_cache_read_tokens` fields come from module-level variables and can be misattributed under concurrent requests. The per-request trace (`metrics`, `steps`) is unaffected, and so are answers and security.
+- **Cost figures are estimates:** computed from list prices in `app/llm.py`, not from billing data.
 - **Mock authentication:** not production-grade; sessions are stateless and can't be revoked before expiry.
 - **Cold start:** the first question after a deploy or idle period takes ~17s until the prompt cache warms.
 - **Judge validation:** the judge prompt was refined between runs (each change backed by deterministic evidence); judged scores should still be spot-checked by a human.
@@ -602,7 +639,7 @@ LLM generation accounts for 80–90% of latency.
 
 ## 17. What I'd improve with more time
 
-1. **Per-step agent tracing and cost:** a trace object passed through every LLM and tool call, recording tokens, latency, and status per step, plus an estimated cost per request. It also removes the module-level metric variables.
+1. **Trace export and dashboards:** send the per-request traces to an OpenTelemetry or LangSmith-style backend for span views, and add CloudWatch dashboards and alarms on cost, p95 latency, and error rate. Replace the remaining module-level log fields with per-request context.
 2. **Business-rule citations:** cite the document behind each definition used (e.g. "market share per `metric_definitions.md`"), the NL-to-SQL equivalent of RAG source citations.
 3. **Semantic verification:** check claims like rankings and comparisons against the rows, not just the numbers.
 4. **Number-to-cell highlighting** and **drill-down** from an aggregate to its transactions.
