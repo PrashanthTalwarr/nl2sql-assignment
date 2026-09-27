@@ -1,134 +1,104 @@
-# NL-to-SQL Chat Assistant
+# NL-to-SQL Commercial Analytics Assistant
 
-## Overview
+A conversational AI agent that answers plain-English questions about pharmaceutical commercial
+sales data (40,000 organizations, 2,000,000 sales rows), with **role-based access control enforced
+in the database layer** and **every number in every answer verified against the query result**.
 
-Build and deploy an end-to-end conversational AI assistant that translates natural language questions into SQL queries against a pharmaceutical sales database. The assistant must understand domain-specific business knowledge (provided in the `docs/` folder) to generate correct queries.
+**▶ Live app: http://35.90.30.116**
 
-The end user — a commercial analytics user (sales rep, regional manager, or HQ analyst) — sees **only a chat interface**. They type a question in plain English, and the assistant responds with an answer. No SQL, no technical details visible to the user unless they ask.
+> Built as a take-home assessment for Avyxa. The UI is branded "Avyxa Pharma Analytics" for the
+> assessment; it is not an official Avyxa product. The data describes a fictional company, NovaPharma.
 
-## Time Estimate
+## Try it in 30 seconds
 
-**4–6 hours**
+1. Open the live app and pick a role: **Executive**, **Director** (Northeast), or **RAM** (New York Metro).
+2. Ask **"What are our total sales?"**
+3. Sign out, pick a different role, and ask the same question.
 
-## The Data
+| Role | What they see |
+|---|---|
+| Executive | Company-wide units **and** WAC dollars |
+| Director | Northeast region only, units only |
+| RAM | New York Metro territory only, units only |
 
-The dataset models a fictional pharmaceutical company's commercial operations with four tables:
+**Other things to try:** "How is Memorial doing?" (ambiguous name → real matching accounts) ·
+"What is our market share for Zenovax in the Docetaxel market?" · "Top 5 accounts this quarter" →
+"Now exclude 340B facilities" (multi-turn) · "Show me the SQL" (SQL is shown only on request) ·
+as a RAM: "Compare all territories" or "What is my revenue in dollars?"
 
-| Table | Rows | Description |
-|-------|------|-------------|
-| `organizations` | 40,000 | Master directory of healthcare facilities, hospitals, IDNs, GPOs |
-| `sales` | 2,000,000 | ~3 years of daily sales transactions across multiple data sources |
-| `products` | 40 | NDC-level drug reference with dosing and market classification |
-| `zip_territory` | ~30,000 | ZIP code to sales territory and region mapping |
+## Results
 
-Run the data generator to produce CSVs:
+| | |
+|---|---|
+| **Evaluation** | **36/36** cases pass (6 categories, 5 rubric dimensions, 18 with execution accuracy against reference SQL). The first run scored 30/36 and found real defects, which were fixed |
+| **Security** | 0 scope or pricing leaks; 13/13 deterministic security checks; all 6 scenarios in `docs/security_model.md` covered |
+| **Other suites** | API 12/12 · name-lookup backstop 15/15 · SQL-on-request 12/12 |
+| **Latency** | Median 8.4s, p95 16.2s; the result table appears before the answer text |
 
-```bash
-python3 schema/generate_data.py
+Details: [`TEST_RESULTS.md`](TEST_RESULTS.md) · full per-case evidence: [`evals/results_final.md`](evals/results_final.md)
+
+## How it works
+
+```
+question → Plan (Claude Sonnet: JSON action + SQL)
+         → [Lookup: resolve fuzzy account names in the user's scope, max 1 hop]
+         → Guard + Execute (read-only SQLite, TEMP views that contain only the user's rows)
+         → [Repair: up to 3 retries on SQL errors]
+         → Answer (Claude Haiku, from the real rows only, streamed)
+         → Verify (code checks every number against the result)
 ```
 
-This creates CSV files in `schema/generated/`. Schema DDL is in `schema/create_tables.sql`. Use `schema/seed_data.sql` for a small sample to develop against locally before loading the full dataset.
+- **Bounded workflow agent:** the LLM makes the judgment calls; code enforces every limit (at most 7 LLM calls per question, typically 2).
+- **Security never depends on the LLM:** out-of-scope rows and the `wac` column don't exist for the user's database connection.
+- **Domain knowledge:** all 8 business documents in the prompt, plus explicit rules for the high-stakes definitions ("sales" = paid demand; the market share formula; account rollups).
+- **Accuracy over latency over cost**, with prompt caching, streaming, and model tiering to keep latency reasonable.
 
-> **Important:** Your solution must work with the full dataset at the scale above (40K organizations, 2M sales rows). This is not optional — your deployed application will be evaluated against the complete dataset. Design your database, queries, and infrastructure accordingly.
+Full design, trade-offs, and assumptions: **[`DESIGN.md`](DESIGN.md)**
 
-### Database Choice
+## Repository layout
 
-You may use **any SQL database** for your solution — SQLite, PostgreSQL, MySQL, etc. NoSQL databases are out of scope. Choose whatever makes sense for your architecture. Load the generated CSVs into your database of choice.
+| Path | Contents |
+|---|---|
+| `app/` | FastAPI app: API (`main.py`), agent (`pipeline.py`), LLM layer and prompts (`llm.py`), security (`security.py`), database tools (`db.py`), number verifier (`verify.py`) |
+| `static/index.html` | Chat UI (single file) |
+| `docs/`, `schema/` | Business documents and data generator (provided with the assignment) |
+| `scripts/` | Database loading and deterministic test suites |
+| `evals/` | Evaluation dataset, DeepEval harness, report renderer, results |
+| `Dockerfile`, `DEPLOY.md` | Container and step-by-step AWS deployment |
 
-## The Task
+## Run locally
 
-### 1. Chat Interface
+```bash
+python -m venv .venv && .venv\Scripts\activate      # Windows (macOS/Linux: source .venv/bin/activate)
+pip install -r requirements.txt
+python schema/generate_data.py                        # generate the CSVs (deterministic)
+python scripts/load_db.py                             # build pharma.db (indexes, NULL fix, ANALYZE)
+copy .env.example .env                                # then add ANTHROPIC_API_KEY and SESSION_SECRET
+uvicorn app.main:app --port 8080                      # open http://localhost:8080
+```
 
-Build a web-based chat UI that the end user interacts with. The user types natural language questions and receives answers. The interface should feel like a conversation — support follow-ups, show thinking/loading states, and present results clearly.
+## Run the tests
 
-The user should **not** need to know SQL, understand the schema, or configure anything. Just open the URL and start asking questions.
+```bash
+python scripts/test_security.py        # 13 checks: scoping, WAC, SQL guard
+python scripts/test_api.py             # 12 checks: auth, validation, rate limit
+python scripts/test_backstop.py        # 15 checks: name lookup and backstop
+python scripts/test_sql_request.py     # 12 checks: SQL on request
+pip install -r requirements-dev.txt
+python evals/run_eval.py               # 36-case evaluation (needs OPENAI_API_KEY for the judge)
+python evals/render_report.py          # formatted report
+```
 
-### 2. NL-to-SQL Engine
+## Deployment
 
-Behind the chat interface, build a backend that:
-1. Takes the user's natural language question
-2. Generates a SQL query against the pharma database
-3. Executes the query
-4. Returns a natural language answer to the user
+Docker image on **AWS EC2**, pulled from **ECR** through an IAM role, with logs in **CloudWatch**.
+See [`DEPLOY.md`](DEPLOY.md) for reproducible steps.
 
-Think about what kinds of questions an analytics user would ask — aggregations, comparisons across time periods, rankings, multi-table joins — and make sure your system handles them well.
+## Documents
 
-### 3. Domain Knowledge
-
-The `docs/` folder contains business knowledge documents that define how metrics are calculated, what each data source means, how the organization hierarchy works, and how products are classified into markets.
-
-A correct SQL query often depends on domain knowledge that isn't in the schema. For example, "market share" has a specific formula involving two different data sources, and "sales" implicitly means only paid demand — not free drug. Your assistant must incorporate this domain knowledge when generating SQL.
-
-How you make this knowledge available to the assistant is up to you.
-
-### 4. Security & Access Control
-
-The system must enforce role-based access control. The `users` table (see `schema/seed_data.sql`) defines three roles:
-
-| Role | Data Scope | WAC (Pricing) Access |
-|------|-----------|---------------------|
-| **Exec** | All territories, all regions | Full access |
-| **Director** | All territories within their assigned region | **No access** — must be excluded from queries |
-| **RAM** | Only their assigned territory | **No access** — must be excluded from queries |
-
-**What this means:**
-- A RAM in "New York Metro" should only see organizations and sales within that territory — never data from other territories
-- A Director of the "Northeast" region sees all territories in that region (New York Metro + New England)
-- An Exec sees everything
-- WAC (wholesale acquisition cost) is sensitive pricing data. Only Execs can see it. Directors and RAMs must never see WAC values. If a non-Exec user asks a revenue question, the assistant should offer volume-based alternatives instead
-- The chat interface must identify who is logged in and enforce these rules on every query
-
-See `docs/security_model.md` for the full access control specification.
-
-### 5. Cloud Deployment
-
-Deploy the full solution to a **cloud provider** so that we can access it via a public URL. The deployed application must be fully functional — chat UI, backend, database, domain knowledge pipeline — all running in the cloud.
-
-You choose the cloud provider and services. **AWS is preferred**, but GCP, Azure, or other cloud platforms are acceptable. Some AWS options to consider (not prescriptive):
-- **Compute**: EC2, ECS/Fargate, Lambda, App Runner, Elastic Beanstalk
-- **Database**: RDS, Aurora, or SQLite on EBS/EFS
-- **Frontend**: S3 + CloudFront, Amplify, or served from the backend
-- **Other**: Bedrock for LLM, OpenSearch for vector search, etc.
-
-Include infrastructure setup instructions or IaC (Terraform, CDK, CloudFormation, Pulumi, etc.) in your repo.
-
-## What We're Looking For
-
-- **End-to-end delivery**: A working, deployed product accessible via URL — not just code on a laptop
-- **Security**: Territory/region scoping enforced correctly, WAC hidden from non-Execs, no data leaks across roles
-- **Correctness**: Does the system answer questions accurately? Does it apply domain knowledge correctly?
-- **User experience**: Clean chat interface, clear answers, graceful error handling, multi-turn support
-- **Domain knowledge integration**: How does the assistant leverage the business docs to produce correct SQL?
-- **Architecture decisions**: Database choice, deployment strategy, prompt design, cost/performance trade-offs
-- **Pragmatism**: Sensible trade-offs, clean code, clear documentation
-
-## Constraints
-
-- Use any LLM provider (OpenAI, Anthropic, AWS Bedrock, open-source, etc.)
-- Use any SQL database (NoSQL is out of scope)
-- Must be deployed to a cloud provider (AWS preferred) and accessible via a public URL
-- Solution must be shared as a **GitHub repository**
-- Include a `DESIGN.md` explaining your approach
-
-## Deliverables
-
-1. **GitHub repository** — all source code, IaC, and documentation
-2. **Live URL** — the deployed chat application in the cloud
-3. **`DESIGN.md`** — covering:
-   - Architecture overview (diagram encouraged)
-   - Database choice and rationale
-   - How domain knowledge is integrated
-   - LLM provider and prompt design
-   - Security implementation — how access control is enforced (auth, query scoping, WAC restriction)
-   - Cloud services used and why
-   - Trade-offs made and what you'd improve with more time
-4. **Test cases & results** — a document or test suite covering:
-   - NL-to-SQL accuracy: sample questions, generated SQL, expected vs actual results
-   - Security: queries from each role (Exec, Director, RAM) demonstrating correct data scoping and WAC restriction
-   - Edge cases: ambiguous questions, invalid inputs, cross-territory access attempts
-   - Include pass/fail status and actual output for each test case
-5. **Demo** — a short screen recording (3–5 min) or transcript showing multi-turn conversations with the deployed app
-
-## Questions?
-
-If anything is unclear, document your assumptions in `DESIGN.md` and proceed. We value pragmatic decision-making over perfection.
+| | |
+|---|---|
+| [`DESIGN.md`](DESIGN.md) | Architecture, agent design, security, trade-offs, assumptions |
+| [`TEST_RESULTS.md`](TEST_RESULTS.md) | Test cases and results |
+| [`evals/results_final.md`](evals/results_final.md) | Every eval case with generated SQL, expected vs. actual rows, and scores |
+| [`DEPLOY.md`](DEPLOY.md) | AWS deployment steps |

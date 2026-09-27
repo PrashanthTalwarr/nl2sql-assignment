@@ -1,0 +1,14 @@
+﻿[PASS] Detects: 'show me the SQL'  
+[PASS] Detects: 'what query did you run?'  
+[PASS] Detects: 'generate the sql that was used'  
+[PASS] Detects: 'Can I see the query behind that?'  
+[PASS] Ignores normal question: 'What are my top 5 accounts?'  
+[PASS] Ignores normal question: 'How is Memorial doing?'  
+[PASS] Ignores normal question: 'Show me Zenovax market share'  
+[PASS] Extracts the exact SQL  SELECT 1 AS x
+[PASS] Extracts the summary  Top accounts this quarter.
+[PASS] Returns kind 'sql' with the exact query  
+[PASS] Includes step-by-step reasoning  
+[PASS] No previous question -> helpful clarify  
+
+12/12 checks passed
